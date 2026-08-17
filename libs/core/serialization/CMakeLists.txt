@@ -120,9 +120,11 @@ set(serialization_headers
     hpx/serialization/detail/refl_serialize_impl.hpp
     hpx/serialization/array.hpp
     hpx/serialization/bitset.hpp
+    hpx/serialization/chrono.hpp
     hpx/serialization/complex.hpp
     hpx/serialization/datapar.hpp
     hpx/serialization/deque.hpp
+    hpx/serialization/error_code.hpp
     hpx/serialization/exception_ptr.hpp
     hpx/serialization/list.hpp
     hpx/serialization/macros.hpp

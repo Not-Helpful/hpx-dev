@@ -6,6 +6,8 @@
 //  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 /// \file all_reduce.hpp
+/// \page hpx::collectives::all_reduce
+/// \headerfile hpx/collectives.hpp
 
 #pragma once
 
@@ -282,10 +284,12 @@ namespace hpx::traits {
                     {
                         if (!data_available && data.size() > 1)
                         {
-                            // compute reduction result only once
+                            // compute reduction result only once; the seed
+                            // data[0] is excluded from the reduced range and
+                            // can be moved into the fold
                             auto it = data.begin();
-                            data[0] = hpx::reduce(
-                                ++it, data.end(), data[0], HPX_MOVE(op));
+                            data[0] = hpx::reduce(++it, data.end(),
+                                HPX_MOVE(data[0]), HPX_MOVE(op));
                             data_available = true;
                         }
                         return data[0];

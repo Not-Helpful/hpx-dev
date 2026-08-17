@@ -6,6 +6,8 @@
 //  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 /// \file scatter.hpp
+/// \page hpx::collectives::scatter_from, hpx::collectives::scatter_to
+/// \headerfile hpx/collectives.hpp
 
 #pragma once
 
@@ -204,7 +206,6 @@ namespace hpx { namespace collectives {
     /// This function receives an element of a set of values operating on
     /// the given base name.
     ///
-    /// \param policy       The execution policy specifying synchronous execution.
     /// \param basename     The base name identifying the scatter operation
     /// \param this_site    The sequence number of this invocation (usually
     ///                     the locality id). This value is optional and
@@ -234,7 +235,6 @@ namespace hpx { namespace collectives {
     /// This function receives an element of a set of values operating on
     /// the given base name.
     ///
-    /// \param policy       The execution policy specifying synchronous execution.
     /// \param comm         A communicator object returned from \a create_communicator
     /// \param this_site    The sequence number of this invocation (usually
     ///                     the locality id). This value is optional and
@@ -263,7 +263,6 @@ namespace hpx { namespace collectives {
     /// This function receives an element of a set of values operating on
     /// the given base name.
     ///
-    /// \param  policy      The execution policy specifying synchronous execution.
     /// \param  comm        A communicator object returned from \a create_communicator
     /// \param  generation  The generational counter identifying the sequence
     ///                     number of the scatter operation performed on the
@@ -291,7 +290,6 @@ namespace hpx { namespace collectives {
     /// This function transmits the value given by \a result to a central scatter
     /// site (where the corresponding \a scatter_from is executed)
     ///
-    /// \param  policy      The execution policy specifying synchronous execution.
     /// \param  basename    The base name identifying the scatter operation
     /// \param  result      The value to transmit to the central scatter point
     ///                     from this call site.
@@ -323,7 +321,6 @@ namespace hpx { namespace collectives {
     /// This function transmits the value given by \a result to a central scatter
     /// site (where the corresponding \a scatter_from is executed)
     ///
-    /// \param  policy      The execution policy specifying synchronous execution.
     /// \param  comm        A communicator object returned from \a create_communicator
     /// \param  result      The value to transmit to the central scatter point
     ///                     from this call site.
@@ -355,7 +352,6 @@ namespace hpx { namespace collectives {
     /// This function transmits the value given by \a result to a central scatter
     /// site (where the corresponding \a scatter_from is executed)
     ///
-    /// \param  policy      The execution policy specifying synchronous execution.
     /// \param  comm        A communicator object returned from \a create_communicator
     /// \param  result      The value to transmit to the central scatter point
     ///                     from this call site.

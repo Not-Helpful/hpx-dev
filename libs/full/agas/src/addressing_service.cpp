@@ -9,11 +9,7 @@
 
 #include <hpx/config.hpp>
 #include <hpx/assert.hpp>
-#include <hpx/modules/actions_base.hpp>
-#include <hpx/modules/agas_base.hpp>
-#include <hpx/modules/async_base.hpp>
 #include <hpx/modules/async_combinators.hpp>
-#include <hpx/modules/async_distributed.hpp>
 #include <hpx/modules/datastructures.hpp>
 #include <hpx/modules/errors.hpp>
 #include <hpx/modules/execution.hpp>
@@ -22,7 +18,6 @@
 #include <hpx/modules/futures.hpp>
 #include <hpx/modules/lock_registration.hpp>
 #include <hpx/modules/logging.hpp>
-#include <hpx/modules/naming.hpp>
 #include <hpx/modules/runtime_configuration.hpp>
 #include <hpx/modules/runtime_local.hpp>
 #include <hpx/modules/serialization.hpp>
@@ -30,6 +25,13 @@
 #include <hpx/modules/thread_support.hpp>
 #include <hpx/modules/type_support.hpp>
 #include <hpx/modules/util.hpp>
+
+#include <hpx/modules/actions_base.hpp>
+#include <hpx/modules/agas_base.hpp>
+#include <hpx/modules/async_base.hpp>
+#include <hpx/modules/async_distributed.hpp>
+#include <hpx/modules/naming.hpp>
+#include <hpx/modules/parcelset_base.hpp>
 
 #include <hpx/agas/addressing_service.hpp>
 
@@ -286,13 +288,9 @@ namespace hpx::agas {
             endpoints = locality_ns_->resolve_locality(gid);
             if (endpoints.empty())
             {
-                std::string const str = hpx::util::format(
-                    "couldn't resolve the given target locality ({})", gid);
-
-                l.unlock();
-
                 HPX_THROWS_IF(ec, hpx::error::bad_parameter,
-                    "addressing_service::resolve_locality", str);
+                    "addressing_service::resolve_locality",
+                    "couldn't resolve the given target locality ({})", gid);
 
                 static parcelset::endpoints_type const empty_endpoints;
                 return empty_endpoints;
@@ -1114,7 +1112,6 @@ namespace hpx::agas {
             HPX_THROW_EXCEPTION(hpx::error::bad_parameter,
                 "addressing_service::get_colocation_id_async",
                 "invalid reference id");
-            return hpx::invalid_id;
         }
 
         return primary_ns_.colocate(id.get_gid());
@@ -2021,6 +2018,43 @@ namespace hpx::agas {
         primary_ns_.register_server_instance(locality_id);
         component_ns_->register_server_instance(locality_id);
         symbol_ns_.register_server_instance(locality_id);
+    }
+
+    void addressing_service::unregister_server_instances(hpx::error_code& ec)
+    {
+        // unregister root server
+        hpx::error_code first_ec;
+
+        hpx::error_code local_ec;
+        symbol_ns_.unregister_server_instance(local_ec);
+        if (local_ec && !first_ec)
+            first_ec = local_ec;
+
+        local_ec = hpx::error_code();
+        component_ns_->unregister_server_instance(local_ec);
+        if (local_ec && !first_ec)
+            first_ec = local_ec;
+
+        local_ec = hpx::error_code();
+        primary_ns_.unregister_server_instance(local_ec);
+        if (local_ec && !first_ec)
+            first_ec = local_ec;
+
+        local_ec = hpx::error_code();
+        locality_ns_->unregister_server_instance(local_ec);
+        if (local_ec && !first_ec)
+            first_ec = local_ec;
+
+        if (first_ec)
+        {
+            HPX_THROWS_IF(ec, hpx::error::internal_server_error,
+                "addressing_service::unregister_server_instances",
+                first_ec.message());
+        }
+        else if (&ec != &hpx::throws)
+        {
+            ec = hpx::make_success_code();
+        }
     }
 
     void addressing_service::garbage_collect_non_blocking(error_code& ec)

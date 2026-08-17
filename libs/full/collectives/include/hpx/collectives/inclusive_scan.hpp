@@ -5,6 +5,8 @@
 //  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 /// \file inclusive_scan.hpp
+/// \page hpx::collectives::inclusive_scan
+/// \headerfile hpx/collectives.hpp
 
 #pragma once
 
@@ -116,7 +118,6 @@ namespace hpx { namespace collectives {
     /// This function performs an inclusive scan operation on a set of values
     /// received from all call sites operating on the given base name.
     ///
-    /// \param  policy      The execution policy specifying synchronous execution.
     /// \param  basename    The base name identifying the inclusive_scan operation
     /// \param  result      The value to transmit to all
     ///                     participating sites from this call site.
@@ -155,7 +156,6 @@ namespace hpx { namespace collectives {
     /// This function performs an inclusive scan operation on a set of values
     /// received from all call sites operating on the given base name.
     ///
-    /// \param  policy      The execution policy specifying synchronous execution.
     /// \param  comm        A communicator object returned from \a create_communicator
     /// \param  result      The value to transmit to all
     ///                     participating sites from this call site.
@@ -186,7 +186,6 @@ namespace hpx { namespace collectives {
     /// This function performs an inclusive scan operation on a set of values
     /// received from all call sites operating on the given base name.
     ///
-    /// \param  policy      The execution policy specifying synchronous execution.
     /// \param  comm        A communicator object returned from \a create_communicator
     /// \param  result      The value to transmit to all
     ///                     participating sites from this call site.
@@ -226,7 +225,6 @@ namespace hpx { namespace collectives {
 #include <hpx/modules/components_base.hpp>
 #include <hpx/modules/functional.hpp>
 #include <hpx/modules/futures.hpp>
-#include <hpx/modules/tag_invoke.hpp>
 #include <hpx/modules/type_support.hpp>
 
 #include <hpx/collectives/argument_types.hpp>

@@ -4,7 +4,7 @@
 <!-- Distributed under the Boost Software License, Version 1.0. (See accompanying -->
 <!-- file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)        -->
 
-# AGENT.md
+# AGENTS.md
 
 Guidance for agents working in `TheHPXProject/hpx`.
 
@@ -29,7 +29,8 @@ CMake, has a large test suite, and follows Boost-style coding conventions.
 ## Coding style
 
 - Follow Boost coding standards.
-- Use 80-character lines.
+- Use 80-character (soft limit) lines that should not exceed 90
+  characters (hard limit).
 - Use spaces only; no tabs.
 - Avoid raw pointers, raw loops, and raw threads wherever possible.
 - Prefer STL-style identifiers: `my_class`, not `MyClass`.
@@ -86,3 +87,13 @@ Add the project license header:
 - Match local patterns in nearby files.
 - Keep changes minimal.
 - Preserve existing APIs and behavior unless the task explicitly asks otherwise.
+
+## Additional guidelines
+
+- Never #include HPX module-internal headers (paths under
+  `libs/<module>/include/hpx/<module>/...`, e.g. `hpx/serialization/serialize.hpp`)
+  from outside that module. Only code that is itself part of a given module may
+  include its internal headers directly. Any other consumer (another module, a test
+  executable, or application code) must include the generated umbrella header
+  `hpx/modules/<module_name>.hpp` instead
+  (e.g. `#include <hpx/modules/serialization.hpp>`).

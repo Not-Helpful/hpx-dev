@@ -9,9 +9,11 @@ set(tests
     serialization_array
     serialization_valarray
     serialization_builtins
+    serialization_chrono
     serialization_complex
     serialization_custom_constructor
     serialization_deque
+    serialization_error_code
     serialization_list
     serialization_map
     serialization_multimap

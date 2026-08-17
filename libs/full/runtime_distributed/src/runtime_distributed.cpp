@@ -25,6 +25,7 @@
 #include <hpx/modules/runtime_configuration.hpp>
 #include <hpx/modules/runtime_local.hpp>
 #include <hpx/modules/static_reinit.hpp>
+#include <hpx/modules/supervision.hpp>
 #include <hpx/modules/thread_pools.hpp>
 #include <hpx/modules/thread_support.hpp>
 #include <hpx/modules/threading_base.hpp>
@@ -178,6 +179,9 @@ namespace hpx {
       , parcel_handler_(rtcfg_)
 #endif
       , agas_client_(rtcfg_)
+#if defined(HPX_HAVE_SUPERVISION)
+      , supervision_manager_(rtcfg)
+#endif
       , pre_main_(pre_main)
       , post_main_(post_main)
     {
@@ -252,6 +256,11 @@ namespace hpx {
 
             init_id_pool_range();
 
+            // The endpoints have just been published, so remember what was
+            // said about this locality. Binding must not contradict it.
+            parcelset::locality const published =
+                pp ? pp->here() : parcelset::locality();
+
             hpx::detail::try_catch_exception_ptr(
                 [&]() {
                     if (pp)
@@ -266,6 +275,26 @@ namespace hpx {
                         hpx::get_error_what(e));
                     std::terminate();
                 });
+
+            // Binding may settle an endpoint that was left open in the
+            // configuration, which every other locality is free to do. The
+            // root is the exception: its endpoint has already been published
+            // above, and the peers that will look for it read that endpoint
+            // from their own configuration rather than from AGAS, so a root
+            // that moved is a root nobody can reach. Only a change is
+            // rejected here; an endpoint that disagreed with the
+            // configuration from the start is a separate, pre-existing
+            // condition and is left alone.
+            if (pp && pp->here() != published)
+            {
+                HPX_THROW_EXCEPTION(hpx::error::network_error,
+                    "runtime_distributed::initialize_agas",
+                    "the AGAS root locality published {} and then bound {}; "
+                    "the root cannot have its endpoint assigned at bind time "
+                    "because every other locality reads that endpoint from "
+                    "its own configuration",
+                    published, pp->here());
+            }
 
             agas::get_big_boot_barrier().wait_bootstrap();
         }
@@ -285,6 +314,14 @@ namespace hpx {
                         hpx::get_error_what(e));
                     std::terminate();
                 });
+
+            // The parcelport has bound by now, so its endpoint is final. It
+            // was recorded when the parcelport was attached, which is before
+            // the bind, so refresh it here: wait_hosted below is what hands
+            // these endpoints to AGAS, and a locality that let the operating
+            // system choose its port would otherwise register the port it
+            // asked for rather than the one it got.
+            parcel_handler_.update_endpoints();
 
             agas::get_big_boot_barrier().wait_hosted(
                 pp ? pp->get_locality_name() : "<console>",
@@ -863,6 +900,13 @@ namespace hpx {
         return agas_client_;
     }
 
+#if defined(HPX_HAVE_SUPERVISION)
+    supervision::supervision_manager&
+    runtime_distributed::get_supervision_manager()
+    {
+        return supervision_manager_;
+    }
+#endif
 #if defined(HPX_HAVE_NETWORKING)
     parcelset::parcelhandler const& runtime_distributed::get_parcel_handler()
         const
@@ -1831,6 +1875,16 @@ namespace hpx::naming {
         return rtd ? &rtd->get_agas_client() : nullptr;
     }
 }    // namespace hpx::naming
+
+#if defined(HPX_HAVE_SUPERVISION)
+namespace hpx::supervision {
+
+    supervision::supervision_manager& get_supervision_manager()
+    {
+        return get_runtime_distributed().get_supervision_manager();
+    }
+}    // namespace hpx::supervision
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 #if defined(HPX_HAVE_NETWORKING)
