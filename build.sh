@@ -1,4 +1,4 @@
-VERSION=built-with-pacman-clang22
+VERSION=built-with-clang-23
 rm -rf build/$VERSION
 mkdir -p build
 mkdir -p build/$VERSION
