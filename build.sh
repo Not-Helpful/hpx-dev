@@ -3,7 +3,7 @@ rm -rf build/$VERSION
 mkdir -p build
 mkdir -p build/$VERSION
 
-CXX=clang++ cmake  -B build/$VERSION \
+CXX=clang++ cmake -B build/$VERSION \
     -DCMAKE_INSTALL_PREFIX=$INSTALLS/hpx/$VERSION \
     -DHPX_WITH_FETCH_ASIO=ON \
     -DHPX_WITH_MALLOC="system" \
