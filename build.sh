@@ -1,4 +1,5 @@
-VERSION=built-with-clang-23
+VERSION=built-with-clang-24
+use.hs llvm 24
 rm -rf build/$VERSION
 mkdir -p build
 mkdir -p build/$VERSION
