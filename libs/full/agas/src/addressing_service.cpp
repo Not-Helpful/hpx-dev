@@ -37,6 +37,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -132,6 +133,10 @@ namespace hpx::agas {
     {
         if (caching_)
             gva_cache_->reserve(ini_.get_agas_local_cache_size());
+
+        std::uint64_t const timeout_ms = ini_.get_agas_rpc_timeout();
+        hpx::agas::set_rpc_timeout(hpx::chrono::steady_duration(
+            std::chrono::milliseconds(timeout_ms)));
     }
 
     void addressing_service::bootstrap(
@@ -216,8 +221,11 @@ namespace hpx::agas {
 
             {
                 std::unique_lock<hpx::shared_mutex> l(resolved_localities_mtx_);
+                resolved_locality_state const state = is_connecting ?
+                    resolved_locality_state::connecting :
+                    resolved_locality_state::connected;
                 auto const [it, inserted] = resolved_localities_.emplace(
-                    prefix, std::make_pair(endpoints, is_connecting));
+                    prefix, resolved_locality{endpoints, state});
 
                 if (!inserted)
                 {
@@ -246,9 +254,61 @@ namespace hpx::agas {
             return is_connecting();
         }
 
+        {
+            std::shared_lock<hpx::shared_mutex> l(resolved_localities_mtx_);
+            if (auto const it = resolved_localities_.find(locality);
+                it != resolved_localities_.end())
+            {
+                resolved_locality_state const state = it->second.state;
+                return state == resolved_locality_state::connecting ||
+                    state == resolved_locality_state::disconnecting;
+            }
+        }
+
+#if defined(HPX_HAVE_NETWORKING)
+        // if we don't know anything about this locality it may have been
+        // disconnected
+        return parcelset::locality_was_disconnected(
+            naming::get_locality_id_from_gid(locality));
+#else
+        return false;
+#endif
+    }
+
+    bool addressing_service::transition_resolved_locality(
+        hpx::naming::gid_type const& locality,
+        resolved_locality_state const from, resolved_locality_state const to)
+    {
+        if (!locality)
+        {
+            return false;
+        }
+
         std::lock_guard<hpx::shared_mutex> l(resolved_localities_mtx_);
         auto const it = resolved_localities_.find(locality);
-        return it != resolved_localities_.end() && it->second.second;
+        if (it == resolved_localities_.end() || it->second.state != from)
+        {
+            return false;
+        }
+
+        it->second.state = to;
+        return true;
+    }
+
+    bool addressing_service::mark_connecting_locality_as_disconnecting(
+        hpx::naming::gid_type const& locality)
+    {
+        return transition_resolved_locality(locality,
+            resolved_locality_state::connecting,
+            resolved_locality_state::disconnecting);
+    }
+
+    bool addressing_service::mark_disconnecting_locality_as_connecting(
+        hpx::naming::gid_type const& locality)
+    {
+        return transition_resolved_locality(locality,
+            resolved_locality_state::disconnecting,
+            resolved_locality_state::connecting);
     }
 
     void addressing_service::register_console(
@@ -257,7 +317,7 @@ namespace hpx::agas {
         std::lock_guard<hpx::shared_mutex> l(resolved_localities_mtx_);
         [[maybe_unused]] auto const [it, inserted] =
             resolved_localities_.emplace(naming::get_gid_from_locality_id(0),
-                std::make_pair(eps, false));
+                resolved_locality{eps, resolved_locality_state::connected});
         HPX_ASSERT(inserted);
     }
 
@@ -277,7 +337,8 @@ namespace hpx::agas {
         {
             resolved_localities_.emplace(
                 naming::get_gid_from_locality_id(locality_id),
-                std::make_pair(endpoint, false));
+                resolved_locality{
+                    endpoint, resolved_locality_state::connected});
             ++locality_id;
         }
     }
@@ -289,9 +350,10 @@ namespace hpx::agas {
         {
             std::shared_lock<hpx::shared_mutex> l(resolved_localities_mtx_);
             it = resolved_localities_.find(gid);
-            if (it != resolved_localities_.end() && !it->second.first.empty())
+            if (it != resolved_localities_.end() &&
+                !it->second.endpoints.empty())
             {
-                return it->second.first;
+                return it->second.endpoints;
             }
         }
 
@@ -316,10 +378,11 @@ namespace hpx::agas {
         it = resolved_localities_.find(gid);
         if (it == resolved_localities_.end())
         {
-            if (HPX_UNLIKELY(
-                    !util::insert_checked(resolved_localities_.emplace(gid,
-                                              std::make_pair(endpoints, false)),
-                        it)))
+            if (HPX_UNLIKELY(!util::insert_checked(
+                    resolved_localities_.emplace(gid,
+                        resolved_locality{HPX_MOVE(endpoints),
+                            resolved_locality_state::connected}),
+                    it)))
             {
                 l.unlock();
 
@@ -332,12 +395,11 @@ namespace hpx::agas {
                 return empty_endpoints;
             }
         }
-        else if (it->second.first.empty() && !endpoints.empty())
+        else if (it->second.endpoints.empty() && !endpoints.empty())
         {
-            resolved_localities_[gid] =
-                std::make_pair(HPX_MOVE(endpoints), false);
+            it->second.endpoints = HPX_MOVE(endpoints);
         }
-        return it->second.first;
+        return it->second.endpoints;
     }
 
     bool addressing_service::unregister_locality(
@@ -730,7 +792,22 @@ namespace hpx::agas {
     hpx::future<naming::address> addressing_service::unbind_range_async(
         naming::gid_type const& lower_id, std::uint64_t const count)
     {
-        return primary_ns_.unbind_gid_async(count, lower_id);
+        hpx::future<naming::address> f =
+            primary_ns_.unbind_gid_async(count, lower_id);
+        if (count != 1 || !naming::detail::is_migratable(lower_id))
+        {
+            return f;
+        }
+
+        return f.then(hpx::launch::sync,
+            [this, lower_id](hpx::future<naming::address>&& f) {
+                naming::address addr = f.get();
+                if (addr.address_ != nullptr)
+                {
+                    erase_migrated_object(lower_id, addr.address_);
+                }
+                return addr;
+            });
     }
 
     bool addressing_service::unbind_range_local(
@@ -740,6 +817,12 @@ namespace hpx::agas {
         try
         {
             addr = primary_ns_.unbind_gid(count, lower_id);
+
+            if (count == 1 && naming::detail::is_migratable(lower_id) &&
+                addr.address_ != nullptr)
+            {
+                erase_migrated_object(lower_id, addr.address_);
+            }
 
             return true;
         }
@@ -788,8 +871,8 @@ namespace hpx::agas {
     bool addressing_service::is_local_address_cached(
         naming::gid_type const& gid, naming::address& addr,
         [[maybe_unused]] std::pair<bool, components::pinned_ptr>& r,
-        hpx::move_only_function<std::pair<bool, components::pinned_ptr>(
-            naming::address const&)>&& f,
+        [[maybe_unused]] hpx::move_only_function<std::pair<bool,
+            components::pinned_ptr>(naming::address const&)>&& f,
         error_code& ec)
     {
         if (!naming::detail::is_migratable(gid))
@@ -2214,16 +2297,30 @@ namespace hpx::agas {
             auto const end = requests.end();
             for (auto it = requests.begin(); it != end; ++it)
             {
-                server::primary_namespace::decrement_credit_action action;
-                hpx::post(action, it->first, HPX_MOVE(it->second));
-            }
+                // ignore errors caused by disconnected localities
+                hpx::detail::try_catch_exception_ptr<hpx::exception>(
+                    [&] {
+                        server::primary_namespace::decrement_credit_action
+                            action;
+                        hpx::post(action, it->first, HPX_MOVE(it->second));
+                    },
+                    [&](hpx::exception const& e) {
+                        if (auto const err = hpx::get_error(e);
+                            err != hpx::error::locality_was_disconnected)
+                        {
+                            throw e;
+                        }
+                    },
+                    [&](std::exception_ptr const& ep) {
+                        std::rethrow_exception(ep);
+                    });
 
-            if (&ec != &throws)
-                ec = make_success_code();
+                if (&ec != &throws)
+                    ec = make_success_code();
+            }
         }
         catch (hpx::exception const& e)
         {
-            l.unlock();
             HPX_RETHROWS_IF(
                 ec, e, "addressing_service::send_refcnt_requests_non_blocking");
         }
@@ -2285,9 +2382,28 @@ namespace hpx::agas {
         auto const end = requests.end();
         for (auto it = requests.begin(); it != end; ++it)
         {
-            server::primary_namespace::decrement_credit_action action;
-            lazy_results.push_back(
-                hpx::async(action, it->first, HPX_MOVE(it->second)));
+            // ignore errors caused by disconnected localities
+            hpx::future<std::vector<std::int64_t>> f;
+            hpx::detail::try_catch_exception_ptr<hpx::exception>(
+                [&] {
+                    server::primary_namespace::decrement_credit_action action;
+                    f = hpx::async(action, it->first, HPX_MOVE(it->second));
+                },
+                [&](hpx::exception const& e) {
+                    if (auto const err = hpx::get_error(e);
+                        err != hpx::error::locality_was_disconnected)
+                    {
+                        throw e;
+                    }
+                },
+                [&](std::exception_ptr const& ep) {
+                    std::rethrow_exception(ep);
+                });
+
+            if (f.valid())
+            {
+                lazy_results.push_back(HPX_MOVE(f));
+            }
         }
 
         return lazy_results;
@@ -2307,8 +2423,39 @@ namespace hpx::agas {
         std::vector<hpx::future<std::vector<std::int64_t>>> lazy_results =
             send_refcnt_requests_async(l);
 
-        // re throw possible errors
-        hpx::wait_all(lazy_results);
+        // wait for operations to finish
+        if (hpx::wait_all_nothrow(lazy_results))
+        {
+            // re throw possible errors
+            for (auto& result : lazy_results)
+            {
+                if (!result.has_exception())
+                {
+                    continue;
+                }
+
+                hpx::detail::try_catch_exception_ptr<hpx::exception>(
+                    [&]() { result.get(); },
+                    [&](hpx::exception const& e) {
+                        if (hpx::get_error(e) !=
+                            hpx::error::locality_was_disconnected)
+                        {
+                            HPX_RETHROWS_IF(ec, e,
+                                "addressing_service::send_refcnt_requests_"
+                                "sync");
+                        }
+                    },
+                    [&](std::exception_ptr const& ep) {
+                        HPX_RETHROWS_IF(ec, ep,
+                            "addressing_service::send_refcnt_requests_sync");
+                    });
+
+                if (ec)
+                {
+                    return;
+                }
+            }
+        }
 
         if (&ec != &throws)
             ec = make_success_code();
@@ -2354,16 +2501,19 @@ namespace hpx::agas {
         {
             naming::gid_type const gid(naming::detail::get_stripped_gid(gid_));
 
-            // insert the object into the map of migrated objects
-            if (auto const it = migrated_objects_table_.find(gid);
-                it == migrated_objects_table_.end())
+            // Mark the object as no longer resident on this locality. A null LVA
+            // distinguishes this state from a component which has migrated back.
+            auto [it, inserted] =
+                migrated_objects_table_.try_emplace(gid, nullptr);
+            if (expect_to_be_marked_as_migrating)
             {
-                HPX_ASSERT(!expect_to_be_marked_as_migrating);
-                migrated_objects_table_.insert(gid);
+                HPX_ASSERT(!inserted);
+                HPX_ASSERT(it->second == nullptr);
             }
             else
             {
-                HPX_ASSERT(expect_to_be_marked_as_migrating);
+                HPX_ASSERT(inserted || it->second != nullptr);
+                it->second = nullptr;
             }
 
             // avoid interactions with the locking in the cache
@@ -2377,7 +2527,13 @@ namespace hpx::agas {
     }
 
     void addressing_service::unmark_as_migrated(
-        naming::gid_type const& gid_, hpx::move_only_function<void()>&& f)
+        naming::gid_type const& gid, hpx::move_only_function<void()>&& f)
+    {
+        unmark_as_migrated(gid, nullptr, HPX_MOVE(f));
+    }
+
+    void addressing_service::unmark_as_migrated(naming::gid_type const& gid_,
+        naming::address_type const lva, hpx::move_only_function<void()>&& f)
     {
         if (!gid_)
         {
@@ -2392,18 +2548,31 @@ namespace hpx::agas {
 
         std::unique_lock<mutex_type> lock(migrated_objects_mtx_);
 
-        // remove the object from the map of migrated objects
+        // Keep the current LVA so that parcels resolved before an earlier
+        // migration can be rejected after the component returns.
         bool remove_from_cache = false;
         if (auto const it = migrated_objects_table_.find(gid);
             it != migrated_objects_table_.end())
         {
-            migrated_objects_table_.erase(it);
+            if (lva != nullptr)
+            {
+                it->second = lva;
+            }
+            else
+            {
+                // Preserve the behavior of the overload without an LVA.
+                migrated_objects_table_.erase(it);
+            }
 
             // remove entry from cache
             if (caching_ && naming::detail::store_in_cache(gid_))
             {
                 remove_from_cache = true;
             }
+        }
+        else if (lva != nullptr)
+        {
+            migrated_objects_table_.emplace(gid, lva);
         }
 
         f();    // call the user code for the component instance to be migrated
@@ -2456,11 +2625,37 @@ namespace hpx::agas {
     {
         naming::gid_type const gid(naming::detail::get_stripped_gid(gid_));
 
-        return migrated_objects_table_.contains(gid);
+        if (auto const it = migrated_objects_table_.find(gid);
+            it != migrated_objects_table_.end())
+        {
+            return it->second == nullptr;
+        }
+        return false;
+    }
+
+    void addressing_service::erase_migrated_object(
+        naming::gid_type const& gid_, naming::address_type const lva)
+    {
+        naming::gid_type const gid(naming::detail::get_stripped_gid(gid_));
+
+        std::lock_guard<mutex_type> lock(migrated_objects_mtx_);
+        if (auto const it = migrated_objects_table_.find(gid);
+            it != migrated_objects_table_.end() && it->second == lva)
+        {
+            migrated_objects_table_.erase(it);
+        }
     }
 
     std::pair<bool, components::pinned_ptr>
     addressing_service::was_object_migrated(naming::gid_type const& gid,
+        hpx::move_only_function<components::pinned_ptr()>&& f) const
+    {
+        return was_object_migrated(gid, nullptr, HPX_MOVE(f));
+    }
+
+    std::pair<bool, components::pinned_ptr>
+    addressing_service::was_object_migrated(
+        naming::gid_type const& gid, naming::address_type const lva,
         hpx::move_only_function<components::pinned_ptr()>&& f    //-V669
     ) const
     {
@@ -2487,8 +2682,14 @@ namespace hpx::agas {
             return std::make_pair(false, f());
         }
 
-        if (was_object_migrated_locked(gid))
+        naming::gid_type const stripped_gid(
+            naming::detail::get_stripped_gid(gid));
+        if (auto const it = migrated_objects_table_.find(stripped_gid);
+            it != migrated_objects_table_.end() &&
+            (it->second == nullptr || (lva != nullptr && it->second != lva)))
+        {
             return std::make_pair(true, components::pinned_ptr());
+        }
 
         [[maybe_unused]] util::ignore_while_checking const ignore(&lock);
 

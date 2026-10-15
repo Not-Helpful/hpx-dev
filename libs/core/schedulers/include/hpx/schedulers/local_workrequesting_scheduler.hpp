@@ -15,6 +15,7 @@
 #include <hpx/modules/logging.hpp>
 #include <hpx/modules/synchronization.hpp>
 #include <hpx/modules/threading_base.hpp>
+#include <hpx/modules/tracing.hpp>
 #include <hpx/modules/type_support.hpp>
 
 #include <hpx/schedulers/lockfree_queue_backends.hpp>
@@ -102,7 +103,7 @@ namespace hpx::threads::policies {
         ////////////////////////////////////////////////////////////////////////
         inline unsigned int random_seed() noexcept
         {
-            static std::random_device rd;
+            std::random_device rd;
             return rd();
         }
 
@@ -163,7 +164,7 @@ namespace hpx::threads::policies {
                 lcos::local::channel_mode::dont_support_close>;
 
         ////////////////////////////////////////////////////////////////////////
-        struct workrequesting_steal_request
+        HPX_CXX_CORE_EXPORT struct workrequesting_steal_request
         {
             enum class state : std::uint16_t
             {
@@ -269,6 +270,10 @@ namespace hpx::threads::policies {
                     // initialize channels needed for work stealing
                     requests_ = new steal_request_channel(size);
                     tasks_ = new task_channel(1);
+
+                    // seed the generator used for victim selection on this
+                    // core
+                    gen_.seed(detail::random_seed());
                 }
             }
 
@@ -292,6 +297,10 @@ namespace hpx::threads::policies {
 
             // core number this scheduler data instance refers to
             std::uint16_t num_thread_ = static_cast<std::uint16_t>(-1);
+
+            // generator used to select a victim for this core, only ever
+            // used by the core itself
+            std::mt19937 gen_;
 
             // adaptive stealing
             std::uint16_t num_recent_steals_ = 0;
@@ -319,7 +328,6 @@ namespace hpx::threads::policies {
           , data_(init.num_queues_)
           , low_priority_queue_(thread_queue_init_)
           , curr_queue_(0)
-          , gen_(detail::random_seed())
           , affinity_data_(init.affinity_data_)
           , num_queues_(init.num_queues_)
           , num_high_priority_queues_(init.num_high_priority_queues_)
@@ -884,9 +892,11 @@ namespace hpx::threads::policies {
             std::size_t max_num_to_steal = 1;
             if (req.stealhalf_)
             {
-                max_num_to_steal = d.queue_->get_pending_queue_length(
-                                       std::memory_order_relaxed) /
-                    2;
+                // the pending queue length is never negative
+                max_num_to_steal =
+                    static_cast<std::size_t>(d.queue_->get_pending_queue_length(
+                                                 std::memory_order_relaxed) /
+                        2);
             }
 
             if (max_num_to_steal != 0)
@@ -911,6 +921,9 @@ namespace hpx::threads::policies {
                 // we are ready to send at least one task
                 if (!thrds.tasks_.empty())
                 {
+                    hpx::tracing::work_stolen_range(
+                        req.num_thread_, d.num_thread_, thrds.tasks_);
+
                     // send these tasks to the core that has sent the steal
                     // request
                     req.channel_->set(HPX_MOVE(thrds));
@@ -1475,9 +1488,12 @@ namespace hpx::threads::policies {
         }
 #endif
 
-        // return a random victim for the current stealing operation
-        std::size_t random_victim(steal_request const& req) noexcept
+        // return a random victim for the current stealing operation, drawn
+        // from the generator owned by the core performing the selection
+        std::size_t random_victim(
+            std::size_t num_thread, steal_request const& req) noexcept
         {
+            std::mt19937& gen = data_[num_thread].data_.gen_;
             std::size_t result;
 
             {
@@ -1489,7 +1505,7 @@ namespace hpx::threads::policies {
                 int attempts = 0;
                 do
                 {
-                    result = uniform(gen_);
+                    result = uniform(gen);
                     if (result != req.num_thread_ &&
                         !test(req.victims_, result))
                     {
@@ -1506,7 +1522,7 @@ namespace hpx::threads::policies {
                     num_queues_ - count(req.victims_) - 1));
 
             // generate one more random number
-            std::size_t selected_victim = uniform(gen_);
+            std::size_t selected_victim = uniform(gen);
             for (std::size_t i = 0; i != num_queues_; ++i)
             {
                 if (!test(req.victims_, i))
@@ -1527,8 +1543,8 @@ namespace hpx::threads::policies {
         }
 
         // return the number of the next victim core
-        std::size_t next_victim([[maybe_unused]] scheduler_data& d,
-            steal_request const& req) noexcept
+        std::size_t next_victim(
+            scheduler_data& d, steal_request const& req) noexcept
         {
             std::size_t victim;
 
@@ -1552,7 +1568,7 @@ namespace hpx::threads::policies {
                 else
 #endif
                 {
-                    victim = random_victim(req);
+                    victim = random_victim(d.num_thread_, req);
                 }
             }
 
@@ -1875,8 +1891,6 @@ namespace hpx::threads::policies {
         thread_queue_type low_priority_queue_;
 
         std::atomic<std::size_t> curr_queue_;
-
-        std::mt19937 gen_;
 
         detail::affinity_data const& affinity_data_;
         std::size_t const num_queues_;
