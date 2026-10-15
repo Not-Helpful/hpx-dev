@@ -130,6 +130,25 @@ namespace hpx::threads::policies {
             typename TerminatedQueuing::template apply<thread_data*>::type;
 
     protected:
+        // Allocate a fresh thread_data (stackless or stackful). Caller must
+        // not hold locks that would deadlock with the allocator.
+        threads::thread_id_ref_type allocate_thread_object(
+            threads::thread_init_data& data, std::ptrdiff_t stacksize)
+        {
+            threads::thread_data* p;
+            if (stacksize == parameters_.nostack_stacksize_)
+            {
+                p = threads::thread_data_stackless::create(
+                    data, this, stacksize);
+            }
+            else
+            {
+                p = threads::thread_data_stackful::create(
+                    data, this, stacksize);
+            }
+            return thread_id_ref_type(p, thread_id_addref::no);
+        }
+
         template <typename Lock>
         void create_thread_object(threads::thread_id_ref_type& thrd,
             threads::thread_init_data& data, Lock& lk)
@@ -174,32 +193,36 @@ namespace hpx::threads::policies {
 
             // ASAN gets confused by reusing threads/stacks
 #if !defined(HPX_HAVE_ADDRESS_SANITIZER)
-            // Check for an unused thread object.
-            if (heap && !heap->empty())    //-V522
+            // Prefer recycled thread objects. If the heap is empty, first
+            // move terminated threads back onto it so recursive async /
+            // fork-join trees (skynet, fib) do not malloc under load.
+            if (heap)    //-V522
             {
-                // Take ownership of the thread object and rebind it.
-                thrd = heap->back();
-                heap->pop_back();
-                get_thread_id_data(thrd)->rebind(data);
+                if (HPX_UNLIKELY(heap->empty()) &&
+                    terminated_items_count_.load(std::memory_order_acquire) !=
+                        0)
+                {
+                    recycle_terminated_for_heap(lk, heap);
+                }
+
+                if (!heap->empty())
+                {
+                    // Take ownership of the thread object and rebind it.
+                    thrd = heap->back();
+                    heap->pop_back();
+                    get_thread_id_data(thrd)->rebind(data);
+                }
+                else
+                {
+                    hpx::unlock_guard<Lock> ull(lk);
+                    thrd = allocate_thread_object(data, stacksize);
+                }
             }
             else
 #endif
             {
                 hpx::unlock_guard<Lock> ull(lk);
-
-                // Allocate a new thread object.
-                threads::thread_data* p;
-                if (stacksize == parameters_.nostack_stacksize_)
-                {
-                    p = threads::thread_data_stackless::create(
-                        data, this, stacksize);
-                }
-                else
-                {
-                    p = threads::thread_data_stackful::create(
-                        data, this, stacksize);
-                }
-                thrd = thread_id_ref_type(p, thread_id_addref::no);
+                thrd = allocate_thread_object(data, stacksize);
             }
         }
 
@@ -319,7 +342,8 @@ namespace hpx::threads::policies {
                             parameters_.min_add_new_count_,
                             parameters_.max_add_new_count_);
                 }
-                else if (work_items_.empty())
+                else if (work_items_count_.data_.load(
+                             std::memory_order_relaxed) == 0)
                 {
                     // add this number of threads
                     add_count = parameters_.min_add_new_count_;
@@ -515,6 +539,65 @@ namespace hpx::threads::policies {
             return terminated_items_count_.load(std::memory_order_acquire) == 0;
         }
 
+        // Bounded recycle for create_thread_object: stop once target_heap has
+        // an object so we do not over-clean while still guaranteeing progress
+        // toward a matching stack size (#6793).
+        template <typename Lock>
+        void recycle_terminated_for_heap(
+            Lock& lk, thread_heap_type* target_heap)
+        {
+            HPX_ASSERT_OWNS_LOCK(lk);
+
+            std::int64_t const count =
+                terminated_items_count_.load(std::memory_order_acquire);
+            if (count == 0)
+            {
+                return;
+            }
+
+            std::int64_t delete_count =
+                (std::min) (static_cast<std::int64_t>(count / 10),
+                    static_cast<std::int64_t>(parameters_.max_delete_count_));
+            delete_count = (std::max) (delete_count,
+                static_cast<std::int64_t>(parameters_.min_delete_count_));
+            delete_count = (std::min) (delete_count, count);
+            if (delete_count == 0)
+            {
+                delete_count = 1;
+            }
+
+            std::int64_t term_delta = 0;
+            std::int64_t map_delta = 0;
+            thread_data* to_delete;
+            while (delete_count && terminated_items_.pop(to_delete))
+            {
+                ++term_delta;
+                thread_id_type tid(to_delete);
+
+                HPX_ASSERT(
+                    &get_thread_id_data(tid)->get_queue<thread_queue>() ==
+                    this);
+
+                if (thread_map_.erase(tid) != 0)
+                {
+                    recycle_thread(HPX_MOVE(tid), lk);
+                    ++map_delta;
+                }
+                --delete_count;
+
+                if (target_heap != nullptr && !target_heap->empty())
+                {
+                    break;
+                }
+            }
+            terminated_items_count_.fetch_sub(
+                term_delta, std::memory_order_acq_rel);
+            [[maybe_unused]] std::int64_t remaining =
+                thread_map_count_.fetch_sub(
+                    map_delta, std::memory_order_acq_rel);
+            HPX_ASSERT(remaining - map_delta >= 0);
+        }
+
     public:
         bool cleanup_terminated(bool delete_all = false)    //-V1071
         {
@@ -623,7 +706,8 @@ namespace hpx::threads::policies {
         std::int64_t get_queue_length(
             std::memory_order order = std::memory_order_acquire) const noexcept
         {
-            return work_items_count_.data_.load(order) +
+            return static_cast<std::int64_t>(
+                       work_items_count_.data_.load(order)) +
                 new_tasks_count_.data_.load(order);
         }
 
@@ -631,7 +715,8 @@ namespace hpx::threads::policies {
         std::int64_t get_pending_queue_length(
             std::memory_order order = std::memory_order_acquire) const noexcept
         {
-            return work_items_count_.data_.load(order);
+            return static_cast<std::int64_t>(
+                work_items_count_.data_.load(order));
         }
 
         // This returns the current length of the staged queue
@@ -862,7 +947,8 @@ namespace hpx::threads::policies {
                 }
 #endif
 
-                bool const finished = (count == ++work_items_count_.data_);
+                bool const finished = (++work_items_count_.data_ ==
+                    static_cast<std::uint64_t>(count));
                 work_items_.push(trd);
                 if (finished)
                     break;
@@ -908,8 +994,8 @@ namespace hpx::threads::policies {
         bool get_next_thread(threads::thread_id_ref_type& thrd,
             bool allow_stealing = false, bool steal = false) HPX_HOT
         {
-            std::int64_t const work_items_count =
-                work_items_count_.data_.load(std::memory_order_relaxed);
+            std::int64_t const work_items_count = static_cast<std::int64_t>(
+                work_items_count_.data_.load(std::memory_order_relaxed));
 
             if (work_items_count == 0)
             {
@@ -956,13 +1042,14 @@ namespace hpx::threads::policies {
         // Return the next threads to be executed, return 0 if none are
         // available
         template <typename Iterator>
-        std::size_t get_next_threads(Iterator it, std::int64_t max_items,
+        std::size_t get_next_threads(Iterator it, std::size_t max_items,
             bool allow_stealing = false, bool steal = false)
         {
-            std::int64_t const work_items_count =
+            // the result is bounded by max_items, so it fits a std::size_t
+            std::size_t const work_items_count = static_cast<std::size_t>(
                 (std::min) (work_items_count_.data_.load(
                                 std::memory_order_relaxed),
-                    max_items);
+                    static_cast<std::uint64_t>(max_items)));
 
             if (work_items_count == 0)
             {
@@ -970,7 +1057,8 @@ namespace hpx::threads::policies {
             }
 
             if (allow_stealing &&
-                parameters_.min_tasks_to_steal_pending_ > work_items_count)
+                parameters_.min_tasks_to_steal_pending_ >
+                    static_cast<std::int64_t>(work_items_count))
             {
                 return 0;
             }
@@ -1054,9 +1142,16 @@ namespace hpx::threads::policies {
 
             terminated_items_.push(thrd);
 
-            if (++terminated_items_count_ > parameters_.max_terminated_threads_)
+            std::int64_t const count = ++terminated_items_count_;
+            if (count > parameters_.max_terminated_threads_)
             {
                 cleanup_terminated(true);    // clean up all terminated threads
+            }
+            else if (count > parameters_.min_delete_count_)
+            {
+                // Recycle early so create_thread_object can reuse stacks
+                // during recursive async bursts (see #6793).
+                cleanup_terminated(false);
             }
         }
 
@@ -1174,10 +1269,10 @@ namespace hpx::threads::policies {
                 return !running;
             }
 
-            if (new_tasks_count < parameters_.min_tasks_to_steal_staged_)
-            {
-                return false;
-            }
+            // Note: min_tasks_to_steal_staged_ does not apply here, this queue
+            // converts its own staged tasks (see the overload below for
+            // stealing). Otherwise fewer staged tasks than that minimum would
+            // never be converted.
 
             // No obvious work has to be done, so a lock won't hurt too much.
             //
@@ -1315,7 +1410,7 @@ namespace hpx::threads::policies {
                 "without changing the code here.");
 
             std::lock_guard<mutex_type> lk(mtx_);
-            for (std::uint64_t i = 0; i < parameters_.init_threads_count_; ++i)
+            for (std::size_t i = 0; i < parameters_.init_threads_count_; ++i)
             {
                 // We don't care about the init parameters since this thread
                 // will be rebound once it is actually used
@@ -1402,7 +1497,7 @@ namespace hpx::threads::policies {
         util::cache_line_data<std::atomic<std::int64_t>> new_tasks_count_;
 
         // count of active work items
-        util::cache_line_data<std::atomic<std::int64_t>> work_items_count_;
+        util::cache_line_data<std::atomic<std::uint64_t>> work_items_count_;
     };
 
 }    // namespace hpx::threads::policies

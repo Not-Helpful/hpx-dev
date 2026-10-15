@@ -63,6 +63,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -416,6 +417,8 @@ namespace hpx {
     defined(__FreeBSD__)
             threads::coroutines::detail::posix::use_guard_pages =
                 cmdline.rtcfg_.use_stack_guard_pages();
+            threads::coroutines::detail::posix::unbind_on_reset =
+                cmdline.rtcfg_.stack_unbind_on_reset();
 #endif
 #ifdef HPX_HAVE_VERIFY_LOCKS
             if (cmdline.rtcfg_.enable_lock_detection())
@@ -1017,23 +1020,21 @@ namespace hpx {
             }
             return default_;
         }
+
+        int finalize_impl(
+            double shutdown_timeout, double localwait, error_code& ec);
+        int disconnect_impl(
+            double shutdown_timeout, double localwait, error_code& ec);
     }    // namespace detail
 
     ///////////////////////////////////////////////////////////////////////////
-    int finalize(double shutdown_timeout, double localwait, error_code& ec)
+    int detail::finalize_impl(
+        double shutdown_timeout, double localwait, error_code& ec)
     {
         if (!threads::get_self_ptr())
         {
             HPX_THROWS_IF(ec, hpx::error::invalid_status, "hpx::finalize",
                 "this function can be called from an HPX thread only");
-            return -1;
-        }
-
-        if (!is_running())
-        {
-            HPX_THROWS_IF(ec, hpx::error::invalid_status, "hpx::finalize",
-                "the runtime system is not active (did you already "
-                "call finalize?)");
             return -1;
         }
 
@@ -1076,7 +1077,35 @@ namespace hpx {
     }
 
     ///////////////////////////////////////////////////////////////////////////
-    int disconnect([[maybe_unused]] double shutdown_timeout,
+    int finalize(double shutdown_timeout, double localwait, error_code& ec)
+    {
+        return detail::finalize_impl(shutdown_timeout, localwait, ec);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    int finalize(double shutdown_timeout, error_code& ec)
+    {
+        return detail::finalize_impl(shutdown_timeout, -1.0, ec);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    int finalize(error_code& ec)
+    {
+        return detail::finalize_impl(-1.0, -1.0, ec);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    int finalize(hpx::chrono::steady_duration shutdown_timeout, error_code& ec)
+    {
+        // the runtime expects the timeout in seconds
+        auto const shutdown_timeout_s =
+            std::chrono::duration_cast<std::chrono::duration<double>>(
+                shutdown_timeout.value());
+        return detail::finalize_impl(shutdown_timeout_s.count(), -1.0, ec);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    int detail::disconnect_impl([[maybe_unused]] double shutdown_timeout,
         [[maybe_unused]] double localwait, [[maybe_unused]] error_code& ec)
     {
 #if defined(HPX_HAVE_DISTRIBUTED_RUNTIME)
@@ -1134,6 +1163,35 @@ namespace hpx {
         return 0;
     }
 
+    ///////////////////////////////////////////////////////////////////////////
+    int disconnect(double shutdown_timeout, double localwait, error_code& ec)
+    {
+        return detail::disconnect_impl(shutdown_timeout, localwait, ec);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    int disconnect(double shutdown_timeout, error_code& ec)
+    {
+        return detail::disconnect_impl(shutdown_timeout, -1.0, ec);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    int disconnect(error_code& ec)
+    {
+        return detail::disconnect_impl(-1.0, -1.0, ec);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    int disconnect(
+        hpx::chrono::steady_duration shutdown_timeout, error_code& ec)
+    {
+        // the runtime expects the timeout in seconds
+        auto const shutdown_timeout_s =
+            std::chrono::duration_cast<std::chrono::duration<double>>(
+                shutdown_timeout.value());
+        return detail::disconnect_impl(shutdown_timeout_s.count(), -1.0, ec);
+    }
+
 #if defined(HPX_HAVE_DISTRIBUTED_RUNTIME)
     ///////////////////////////////////////////////////////////////////////////
     int force_disconnect(
@@ -1175,12 +1233,12 @@ namespace hpx {
             return -1;
         }
 
-        if (!agas::is_connecting(locality.get_gid()))
+        if (parcelset::locality_was_disconnected(
+                naming::get_locality_id_from_id(locality)))
         {
             HPX_THROWS_IF(ec, hpx::error::bad_parameter,
                 "hpx::force_disconnect",
-                "hpx::force_disconnect can be called to disconnect only a "
-                "locality that was connecting late.");
+                "the requested locality was already disconnected.");
             return -1;
         }
 

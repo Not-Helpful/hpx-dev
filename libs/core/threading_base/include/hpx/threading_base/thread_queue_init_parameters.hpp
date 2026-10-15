@@ -35,9 +35,9 @@ namespace hpx::threads::policies {
                 HPX_THREAD_QUEUE_MAX_DELETE_COUNT),
             std::int64_t max_terminated_threads = static_cast<std::int64_t>(
                 HPX_THREAD_QUEUE_MAX_TERMINATED_THREADS),
-            std::uint64_t init_threads_count = static_cast<std::uint64_t>(
+            std::size_t init_threads_count = static_cast<std::size_t>(
                 HPX_THREAD_QUEUE_INIT_THREADS_COUNT),
-            std::uint64_t cached_threads_count = static_cast<std::uint64_t>(
+            std::size_t cached_threads_count = static_cast<std::size_t>(
                 HPX_THREAD_QUEUE_CACHED_THREADS_COUNT),
             double max_idle_backoff_time = static_cast<double>(
                 HPX_IDLE_BACKOFF_TIME_MAX),
@@ -50,7 +50,9 @@ namespace hpx::threads::policies {
           , min_tasks_to_steal_staged_(min_tasks_to_steal_staged)
           , min_add_new_count_(min_add_new_count)
           , max_add_new_count_(max_add_new_count)
-          , min_delete_count_(min_delete_count)
+          , min_delete_count_(min_delete_count < max_delete_count ?
+                    min_delete_count :
+                    max_delete_count)
           , max_delete_count_(max_delete_count)
           , max_terminated_threads_(max_terminated_threads)
           , init_threads_count_(init_threads_count)
@@ -72,8 +74,8 @@ namespace hpx::threads::policies {
         std::int64_t min_delete_count_;
         std::int64_t max_delete_count_;
         std::int64_t max_terminated_threads_;
-        std::uint64_t init_threads_count_;
-        std::uint64_t cached_threads_count_;
+        std::size_t init_threads_count_;
+        std::size_t cached_threads_count_;
         double max_idle_backoff_time_;
         std::ptrdiff_t const small_stacksize_;
         std::ptrdiff_t const medium_stacksize_;

@@ -12,6 +12,7 @@
 #include <hpx/modules/async_base.hpp>
 #include <hpx/modules/concurrency.hpp>
 #include <hpx/modules/errors.hpp>
+#include <hpx/modules/format.hpp>
 #include <hpx/modules/functional.hpp>
 #include <hpx/modules/futures.hpp>
 #include <hpx/modules/runtime_local.hpp>
@@ -25,9 +26,11 @@
 #include <hpx/modules/parcelset_base.hpp>
 
 #include <hpx/async_distributed/detail/async_implementations_fwd.hpp>
+#include <hpx/async_distributed/detail/locality_disconnected.hpp>
 #include <hpx/async_distributed/packaged_action.hpp>
 
 #include <cstddef>
+#include <exception>
 #include <utility>
 
 namespace hpx::detail {
@@ -141,21 +144,19 @@ namespace hpx::detail {
         static hpx::future<Result> call(
             hpx::id_type const& /*id*/, naming::address&& addr, Ts&&... vs)
         {
-            try
-            {
-                using remote_result_type = Action::remote_result_type;
-                using get_remote_result_type =
-                    traits::get_remote_result<Result, remote_result_type>;
+            return hpx::detail::try_catch_exception_ptr(
+                [&]() {
+                    using remote_result_type = Action::remote_result_type;
+                    using get_remote_result_type =
+                        traits::get_remote_result<Result, remote_result_type>;
 
-                return make_ready_future(
-                    get_remote_result_type::call(Action::execute_function(
-                        addr.address_, addr.type_, HPX_FORWARD(Ts, vs)...)));
-            }
-            catch (...)
-            {
-                return make_exceptional_future<Result>(
-                    std::current_exception());
-            }
+                    return make_ready_future(get_remote_result_type::call(
+                        Action::execute_function(addr.address_, addr.type_,
+                            HPX_FORWARD(Ts, vs)...)));
+                },
+                [](std::exception_ptr const& ep) {
+                    return make_exceptional_future<Result>(ep);
+                });
         }
     };
 
@@ -176,17 +177,15 @@ namespace hpx::detail {
         static hpx::future<void> call(
             hpx::id_type const& /*id*/, naming::address&& addr, Ts&&... vs)
         {
-            try
-            {
-                Action::execute_function(
-                    addr.address_, addr.type_, HPX_FORWARD(Ts, vs)...);
-
-                return make_ready_future();
-            }
-            catch (...)
-            {
-                return make_exceptional_future<void>(std::current_exception());
-            }
+            return hpx::detail::try_catch_exception_ptr(
+                [&]() {
+                    Action::execute_function(
+                        addr.address_, addr.type_, HPX_FORWARD(Ts, vs)...);
+                    return make_ready_future();
+                },
+                [](std::exception_ptr const& ep) {
+                    return make_exceptional_future<void>(ep);
+                });
         }
     };
 
@@ -206,15 +205,30 @@ namespace hpx::detail {
                     hpx::util::thread_local_caching_allocator<
                         hpx::lockfree::variable_size_stack,
                         hpx::util::internal_allocator<>>;
-                lcos::packaged_action<Action, Result> p(
-                    std::allocator_arg, allocator_type{});
+
+                using packaged_action_type =
+                    lcos::packaged_action<Action, Result>;
+
+                packaged_action_type p(std::allocator_arg, allocator_type{});
 
                 f = p.get_future();
-                p.post_cb(HPX_MOVE(addr), hmt.get_id(),
-                    HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
-                f.wait();
+                bool const result = hpx::detail::try_catch_exception_ptr(
+                    [&]() {
+                        p.post_cb(HPX_MOVE(addr), hmt.get_id(),
+                            HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
+                        return true;
+                    },
+                    [&](std::exception_ptr const& e) {
+                        p.set_exception(e);
+                        return false;
+                    });
+
+                if (result)
+                {
+                    f.wait();
+                }
+                return f;
             }
-            return f;
         }
     };
 
@@ -235,12 +249,28 @@ namespace hpx::detail {
             using allocator_type = hpx::util::thread_local_caching_allocator<
                 hpx::lockfree::variable_size_stack,
                 hpx::util::internal_allocator<>>;
-            lcos::packaged_action<action_type, result_type> p(
-                std::allocator_arg, allocator_type{});
+
+            using packaged_action_type =
+                lcos::packaged_action<action_type, result_type>;
+
+            packaged_action_type p(std::allocator_arg, allocator_type{});
 
             f = p.get_future();
-            p.post(HPX_MOVE(addr), hmt.get_id(), HPX_FORWARD(Ts, vs)...);
-            f.wait();
+            bool const result = hpx::detail::try_catch_exception_ptr(
+                [&]() {
+                    p.post(
+                        HPX_MOVE(addr), hmt.get_id(), HPX_FORWARD(Ts, vs)...);
+                    return true;
+                },
+                [&](std::exception_ptr const& e) {
+                    p.set_exception(e);
+                    return false;
+                });
+
+            if (result)
+            {
+                f.wait();
+            }
         }
         return f;
     }
@@ -261,14 +291,22 @@ namespace hpx::detail {
             using allocator_type = hpx::util::thread_local_caching_allocator<
                 hpx::lockfree::variable_size_stack,
                 hpx::util::internal_allocator<>>;
-            lcos::packaged_action<action_type, result_type> p(
-                std::allocator_arg, allocator_type{});
+
+            using packaged_action_type =
+                lcos::packaged_action<action_type, result_type>;
+
+            packaged_action_type p(std::allocator_arg, allocator_type{});
 
             f = p.get_future();
-            p.post_p(
-                HPX_MOVE(addr), hmt.get_id(), policy, HPX_FORWARD(Ts, vs)...);
+            hpx::detail::try_catch_exception_ptr(
+                [&]() {
+                    p.post_p(HPX_MOVE(addr), hmt.get_id(), policy,
+                        HPX_FORWARD(Ts, vs)...);
+                },
+                [&](std::exception_ptr const& e) { p.set_exception(e); });
+
+            return f;
         }
-        return f;
     }
 
     HPX_CXX_EXPORT template <typename Action, typename... Ts>
@@ -287,21 +325,29 @@ namespace hpx::detail {
             using allocator_type = hpx::util::thread_local_caching_allocator<
                 hpx::lockfree::variable_size_stack,
                 hpx::util::internal_allocator<>>;
-            lcos::packaged_action<action_type, result_type> p(
-                std::allocator_arg, allocator_type{});
+
+            using packaged_action_type =
+                lcos::packaged_action<action_type, result_type>;
+
+            packaged_action_type p(std::allocator_arg, allocator_type{});
 
             f = p.get_future();
-            p.post_deferred(
-                HPX_MOVE(addr), hmt.get_id(), policy, HPX_FORWARD(Ts, vs)...);
+            hpx::detail::try_catch_exception_ptr(
+                [&]() {
+                    p.post_deferred(HPX_MOVE(addr), hmt.get_id(), policy,
+                        HPX_FORWARD(Ts, vs)...);
+                },
+                [&](std::exception_ptr const& e) { p.set_exception(e); });
+
+            return f;
         }
-        return f;
     }
 
     // generic function for dynamic launch policy
     HPX_CXX_EXPORT template <typename Action, typename... Ts>
     hpx::future<
         typename hpx::traits::extract_action_t<Action>::local_result_type>
-    async_remote_impl(launch policy, hpx::id_type const& id,
+    async_remote_impl(launch const policy, hpx::id_type const& id,
         naming::address&& addr, Ts&&... vs)
     {
         if (policy == launch::sync)
@@ -320,8 +366,11 @@ namespace hpx::detail {
                 launch::deferred, id, HPX_MOVE(addr), HPX_FORWARD(Ts, vs)...);
         }
 
-        HPX_THROW_EXCEPTION(hpx::error::bad_parameter, "async_remote_impl",
-            "unknown launch policy");
+        using result_type =
+            hpx::traits::extract_action_t<Action>::local_result_type;
+        return hpx::make_exceptional_future<result_type>(
+            HPX_GET_EXCEPTION(hpx::error::bad_parameter, "async_remote_impl",
+                "unknown launch policy"));
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -348,7 +397,6 @@ namespace hpx::detail {
 #if defined(HPX_HAVE_THREAD_DESCRIPTION)
 ///////////////////////////////////////////////////////////////////////////////
 namespace hpx::traits {
-
     template <typename Action>
     struct get_function_address<hpx::detail::action_invoker<Action>>
     {
@@ -424,15 +472,12 @@ namespace hpx::detail {
         using action_type = hpx::traits::extract_action_t<Action>;
         using component_type = action_type::component_type;
 
-#if defined(HPX_HAVE_FORCE_DISCONNECT)
-        if (parcelset::locality_was_disconnected(
-                naming::get_locality_id_from_id(id)))
+        if (locality_is_disconnected(id))
         {
-            HPX_THROW_EXCEPTION(hpx::error::locality_was_disconnected,
-                "hpx::detail::async_impl",
-                "the requested locality {} was disconnected", id);
+            return hpx::make_exceptional_future<
+                typename action_type::local_result_type>(
+                get_locality_disconnected_exception(id));
         }
-#endif
 
         [[maybe_unused]] std::pair<bool, components::pinned_ptr> r;
         naming::address addr;
@@ -495,15 +540,11 @@ namespace hpx::detail {
         using result_type = action_type::local_result_type;
         using component_type = action_type::component_type;
 
-#if defined(HPX_HAVE_FORCE_DISCONNECT)
-        if (parcelset::locality_was_disconnected(
-                naming::get_locality_id_from_id(id)))
+        if (locality_is_disconnected(id))
         {
-            HPX_THROW_EXCEPTION(hpx::error::locality_was_disconnected,
-                "hpx::detail::async_cb_impl",
-                "the requested locality {} was disconnected", id);
+            return hpx::make_exceptional_future<result_type>(
+                get_locality_disconnected_exception(id));
         }
-#endif
 
         [[maybe_unused]] std::pair<bool, components::pinned_ptr> r;
         naming::address addr;
@@ -561,40 +602,51 @@ namespace hpx::detail {
         // Note: the pinned_ptr is still being held, if necessary
         future<result_type> f;
         {
+            using allocator_type = hpx::util::thread_local_caching_allocator<
+                hpx::lockfree::variable_size_stack,
+                hpx::util::internal_allocator<>>;
+
+            using packaged_action_type =
+                lcos::packaged_action<action_type, result_type>;
+
             handle_managed_target<result_type> hmt(id, f);
 
             if (policy == launch::sync || hpx::has_async_policy(policy))
             {
-                using allocator_type =
-                    hpx::util::thread_local_caching_allocator<
-                        hpx::lockfree::variable_size_stack,
-                        hpx::util::internal_allocator<>>;
-                lcos::packaged_action<action_type, result_type> p(
-                    std::allocator_arg, allocator_type{});
+                packaged_action_type p(std::allocator_arg, allocator_type{});
 
                 f = p.get_future();
-                p.post_p_cb(HPX_MOVE(addr), hmt.get_id(), policy,
-                    HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
-                if (policy == launch::sync)
+                bool const result = hpx::detail::try_catch_exception_ptr(
+                    [&]() {
+                        p.post_p_cb(HPX_MOVE(addr), hmt.get_id(), policy,
+                            HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
+                        return true;
+                    },
+                    [&](std::exception_ptr const& e) {
+                        p.set_exception(e);
+                        return false;
+                    });
+
+                if (result && policy == launch::sync)
                     f.wait();
             }
             else if (policy == launch::deferred)
             {
-                using allocator_type =
-                    hpx::util::thread_local_caching_allocator<
-                        hpx::lockfree::variable_size_stack,
-                        hpx::util::internal_allocator<>>;
-                lcos::packaged_action<action_type, result_type> p(
-                    std::allocator_arg, allocator_type{});
+                packaged_action_type p(std::allocator_arg, allocator_type{});
 
                 f = p.get_future();
-                p.post_deferred_cb(HPX_MOVE(addr), hmt.get_id(), policy,
-                    HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
+                hpx::detail::try_catch_exception_ptr(
+                    [&]() {
+                        p.post_deferred_cb(HPX_MOVE(addr), hmt.get_id(), policy,
+                            HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
+                    },
+                    [&](std::exception_ptr const& e) { p.set_exception(e); });
             }
             else
             {
-                HPX_THROW_EXCEPTION(hpx::error::bad_parameter, "async_cb_impl",
-                    "unknown launch policy");
+                return hpx::make_exceptional_future<result_type>(
+                    HPX_GET_EXCEPTION(hpx::error::bad_parameter,
+                        "async_cb_impl", "unknown launch policy"));
             }
         }
         return f;
@@ -610,15 +662,11 @@ namespace hpx::detail {
         using result_type = action_type::local_result_type;
         using component_type = action_type::component_type;
 
-#if defined(HPX_HAVE_FORCE_DISCONNECT)
-        if (parcelset::locality_was_disconnected(
-                naming::get_locality_id_from_id(id)))
+        if (locality_is_disconnected(id))
         {
-            HPX_THROW_EXCEPTION(hpx::error::locality_was_disconnected,
-                "hpx::detail::async_impl",
-                "the requested locality {} was disconnected", id);
+            return hpx::make_exceptional_future<result_type>(
+                get_locality_disconnected_exception(id));
         }
-#endif
 
         [[maybe_unused]] std::pair<bool, components::pinned_ptr> r;
         naming::address addr;
@@ -663,13 +711,28 @@ namespace hpx::detail {
             using allocator_type = hpx::util::thread_local_caching_allocator<
                 hpx::lockfree::variable_size_stack,
                 hpx::util::internal_allocator<>>;
-            lcos::packaged_action<action_type, result_type> p(
-                std::allocator_arg, allocator_type{});
+
+            using packaged_action_type =
+                lcos::packaged_action<action_type, result_type>;
+
+            packaged_action_type p(std::allocator_arg, allocator_type{});
 
             f = p.get_future();
-            p.post_p_cb(HPX_MOVE(addr), hmt.get_id(), policy,
-                HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
-            f.wait();
+            bool const result = hpx::detail::try_catch_exception_ptr(
+                [&]() {
+                    p.post_p_cb(HPX_MOVE(addr), hmt.get_id(), policy,
+                        HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
+                    return true;
+                },
+                [&](std::exception_ptr const& e) {
+                    p.set_exception(e);
+                    return false;
+                });
+
+            if (result)
+            {
+                f.wait();
+            }
         }
         return f;
     }
@@ -684,15 +747,11 @@ namespace hpx::detail {
         using result_type = action_type::local_result_type;
         using component_type = action_type::component_type;
 
-#if defined(HPX_HAVE_FORCE_DISCONNECT)
-        if (parcelset::locality_was_disconnected(
-                naming::get_locality_id_from_id(id)))
+        if (locality_is_disconnected(id))
         {
-            HPX_THROW_EXCEPTION(hpx::error::locality_was_disconnected,
-                "hpx::detail::async_impl",
-                "the requested locality {} was disconnected", id);
+            return hpx::make_exceptional_future<result_type>(
+                get_locality_disconnected_exception(id));
         }
-#endif
 
         [[maybe_unused]] std::pair<bool, components::pinned_ptr> r;
         naming::address addr;
@@ -753,12 +812,19 @@ namespace hpx::detail {
             using allocator_type = hpx::util::thread_local_caching_allocator<
                 hpx::lockfree::variable_size_stack,
                 hpx::util::internal_allocator<>>;
-            lcos::packaged_action<action_type, result_type> p(
-                std::allocator_arg, allocator_type{});
+
+            using packaged_action_type =
+                lcos::packaged_action<action_type, result_type>;
+
+            packaged_action_type p(std::allocator_arg, allocator_type{});
 
             f = p.get_future();
-            p.post_p_cb(HPX_MOVE(addr), hmt.get_id(), async_policy,
-                HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
+            hpx::detail::try_catch_exception_ptr(
+                [&]() {
+                    p.post_p_cb(HPX_MOVE(addr), hmt.get_id(), async_policy,
+                        HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
+                },
+                [&](std::exception_ptr const& e) { p.set_exception(e); });
         }
         return f;
     }
@@ -772,15 +838,11 @@ namespace hpx::detail {
         using action_type = hpx::traits::extract_action_t<Action>;
         using result_type = action_type::local_result_type;
 
-#if defined(HPX_HAVE_FORCE_DISCONNECT)
-        if (parcelset::locality_was_disconnected(
-                naming::get_locality_id_from_id(id)))
+        if (locality_is_disconnected(id))
         {
-            HPX_THROW_EXCEPTION(hpx::error::locality_was_disconnected,
-                "hpx::detail::async_impl",
-                "the requested locality {} was disconnected", id);
+            return hpx::make_exceptional_future<result_type>(
+                get_locality_disconnected_exception(id));
         }
-#endif
 
         naming::address addr;
         [[maybe_unused]] bool result = agas::is_local_address_cached(id, addr);
@@ -792,12 +854,19 @@ namespace hpx::detail {
             using allocator_type = hpx::util::thread_local_caching_allocator<
                 hpx::lockfree::variable_size_stack,
                 hpx::util::internal_allocator<>>;
-            lcos::packaged_action<action_type, result_type> p(
-                std::allocator_arg, allocator_type{});
+
+            using packaged_action_type =
+                lcos::packaged_action<action_type, result_type>;
+
+            packaged_action_type p(std::allocator_arg, allocator_type{});
 
             f = p.get_future();
-            p.post_deferred_cb(HPX_MOVE(addr), hmt.get_id(), policy,
-                HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
+            hpx::detail::try_catch_exception_ptr(
+                [&]() {
+                    p.post_deferred_cb(HPX_MOVE(addr), hmt.get_id(), policy,
+                        HPX_FORWARD(Callback, cb), HPX_FORWARD(Ts, vs)...);
+                },
+                [&](std::exception_ptr const& e) { p.set_exception(e); });
         }
         return f;
     }
