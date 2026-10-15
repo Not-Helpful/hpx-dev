@@ -9,7 +9,7 @@ CXX=clang++ cmake -B build/$VERSION \
     -DHPX_WITH_FETCH_ASIO=ON \
     -DHPX_WITH_MALLOC="system" \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-    -DHPX_WITH_CXX_STANDARD=23 .
+    -DHPX_WITH_CXX_STANDARD=20 .
 
 
 mkdir -p $INSTALLS/hpx
